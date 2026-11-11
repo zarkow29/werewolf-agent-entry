@@ -244,6 +244,30 @@ def inspected(view):
     return {r.get("seat") for r in (view.get("seerResults") or [])}
 
 
+def cleared_seat(view):
+    """Newest living seat my own inspections cleared, else the newest cleared one.
+
+    A cleared seat is what an early claim has to sell: the claim is credible
+    because the inspection is real, not because a wolf finding exists yet.
+    """
+    rows = cleared_seats(view)
+    return rows[0] if rows else None
+
+
+def cleared_seats(view):
+    """Cleared seats, newest first, living ones preferred, so a claim can name two."""
+    rows = [
+        r
+        for r in (view.get("seerResults") or [])
+        if not r.get("werewolf") and r.get("seat") is not None
+    ]
+    if not rows:
+        return []
+    alive = set(alive_seats(view))
+    live = [r for r in rows if r["seat"] in alive]
+    return [r["seat"] for r in reversed(live or rows)]
+
+
 def last_protected(view):
     p = view.get("lastProtect") or {}
     return p.get("seat")
@@ -289,6 +313,66 @@ def claimed_doctor(view):
     return out
 
 
+def claim_like(text):
+    """True when a folded line reads like a seer claim, not just a mention of one."""
+    if "seer" not in text and "inspector" not in text:
+        return False
+    return "night" in text or "inspect" in text or "here" in text
+
+
+def burned_claim(view):
+    """True when a seat that claimed the seer was exiled and revealed a werewolf.
+
+    Only a claim counts, not a mere mention of the role: a wolf that said "the
+    seer should speak" must not burn every later claimant's cover.
+    """
+    revealed = revealed_roles(view)
+    seat = my_seat(view)
+    for e in speeches(view):
+        s = e.get("seat")
+        if s is None or s == seat:
+            continue
+        if revealed.get(s) != "werewolf":
+            continue
+        if claim_like(named_by(e)):
+            return True
+    return False
+
+
+def believable_claim(view, pool):
+    """Claimed seers in `pool` that nothing revealed contradicts and trust backs.
+
+    A claim the table already burned, or one whose trust has gone negative, is
+    not worth a night's cover; the caller falls through to the weight ranking.
+    """
+    revealed = revealed_roles(view)
+    seen_seer = [s for s, r in revealed.items() if r == "seer"]
+    out = []
+    for s in claim_order(view, [c for c in claimed_seer(view) if c in pool]):
+        role = revealed.get(s)
+        if role and role != "seer":
+            continue
+        if seen_seer and s not in seen_seer:
+            continue
+        if trust_score(view, s) < 0:
+            continue
+        out.append(s)
+    return out
+
+
+def cover_claimant(view, pool=None):
+    """The claimed seer the doctor may cover tonight, None when the claim is burned.
+
+    A burned claim (its claimant exiled and revealed a werewolf) means the next
+    claimant is the wolf's echo, so no claimant gets cover at all and the
+    caller falls through to the weight ranking.
+    """
+    if burned_claim(view):
+        return None
+    pool = list(pool) if pool is not None else living_others(view)
+    return pick(pool, believable_claim(view, pool))
+
+
 def doctor_cover(view, finds):
     """The claimed doctor that spoke of one of my findings, else any claimed doctor."""
     docs = claimed_doctor(view)
@@ -304,25 +388,63 @@ def doctor_cover(view, finds):
 
 
 def seer_claim(view, finds):
-    """The full claim: newest wolf first, then the running list, then the doctor."""
+    """The full claim: newest wolf first, seat spelled out, then the rest of the sheet.
+
+    The table has to be told where to put its vote, so the wagon is a seat
+    number and not a name it might misspell. Repeating this every day after the
+    first finding is the point: silence costs more than a repeated case.
+    """
     newest = finds[-1]
-    text = "seer, night %s inspected %s, %s is a werewolf, exile %s" % (
+    text = "seer, night %s inspected %s: werewolf. Take seat %s, exile %s" % (
         inspect_night(view, newest),
         name_of(view, newest),
-        name_of(view, newest),
+        newest,
         name_of(view, newest),
     )
-    older = []
-    for s in reversed(finds[:-1]):
-        older.append("night %s: %s" % (inspect_night(view, s), name_of(view, s)))
+    older = [
+        "night %s: %s (seat %s)" % (inspect_night(view, s), name_of(view, s), s)
+        for s in reversed(finds[:-1])
+    ]
     tail = "; earlier " + ", ".join(older) + " all wolves" if older else ""
-    if len(text + tail) > MAX_CHARS - 45:
+    if len(text + tail) > MAX_CHARS - 60:
         tail = ""
-    text += tail
+    text += tail + "."
     doc = doctor_cover(view, finds)
     if doc is not None:
         text += "; doctor %s is covering me" % name_of(view, doc)
-    return clip(text)
+    return clip(text, MAX_CHARS - 1)
+
+
+def early_claim(view, seat=None, rng=None):
+    """Claim with no wolf yet: the cleared seats carry it, plus a named suspect.
+
+    The claim is only worth making if it says something checkable, so each
+    cleared seat comes with its own night, the suspect the table should push is
+    named and spelled as a seat number, and the doctor is asked for cover.
+    """
+    if rng is None:
+        rng = random.Random(0)
+    cleared = cleared_seats(view)[:2]
+    pool = [s for s in living_others(view) if s not in cleared and s != seat]
+    suspect = villager_suspect(view, rng) if pool else None
+    if suspect in cleared:
+        # A cleared seat cannot be the wagon it is also asked to carry.
+        suspect = None
+    if suspect is None and pool:
+        hot = most_accused(view, pool)
+        suspect = hot[0] if hot else pool[0]
+    if cleared:
+        named = ", ".join(
+            "%s (seat %s, night %s)" % (name_of(view, s), s, inspect_night(view, s))
+            for s in cleared
+        )
+        text = "seer: my inspections cleared %s, no wolf yet." % named
+    else:
+        text = "seer here, and no wolf on my sheet yet."
+    if suspect is not None:
+        text += " Suspect is %s: take seat %s." % (name_of(view, suspect), suspect)
+    text += " Doctor cover me."
+    return clip(text, MAX_CHARS - 1)
 
 
 def pressure_text(view, rng):
@@ -367,7 +489,7 @@ def counter_claim(view, rng):
             target = rng.choice(pool)
         night = max(1, view.get("day", 2) - 1)
         FALSE_FINDING[game] = (target, night)
-    rival = sorted(claimed_seer(view), key=lambda s: (-trust_score(view, s), s))
+    rival = claim_order(view, claimed_seer(view))
     tail = ""
     if rival:
         tail = "; %s is the lie" % name_of(view, rival[0])
@@ -508,12 +630,44 @@ def trust_score(view, claimant):
     return score
 
 
+def claim_started(view, seat):
+    """(day, log index) of a seat's first speech naming the seer role.
+
+    A wolf only counter-claims once a real claim is on the table, so the earlier
+    claimant is the likelier true seer. A claim-like line beats a mere mention,
+    and a seat that never spoke of the role at all sorts last.
+    """
+    mention = (999, 999)
+    for i, e in enumerate(log_of(view)):
+        if e.get("kind") != "speech" or e.get("seat") != seat:
+            continue
+        text = named_by(e)
+        if "seer" not in text and "inspector" not in text:
+            continue
+        day = e.get("day")
+        when = (day if isinstance(day, int) else 0, i)
+        if claim_like(text):
+            return when
+        if mention == (999, 999):
+            mention = when
+    return mention
+
+
+def claim_order(view, seats):
+    """Claims by trust, then by who claimed first, then by the lowest seat."""
+    return sorted(seats, key=lambda s: (-trust_score(view, s), claim_started(view, s), s))
+
+
 def trusted_claim(view):
-    """The claimed seer the revealed dead roles back, or None with no claim."""
+    """The claimed seer the revealed dead roles back, or None with no claim.
+
+    Trust first, but a tie goes to the earlier claim: the wolf's counter-claim
+    necessarily lands after the true seer's, so the tie is not really a tie.
+    """
     claims = claimed_seer(view)
     if not claims:
         return None
-    return sorted(claims, key=lambda s: (-trust_score(view, s), s))[0]
+    return claim_order(view, claims)[0]
 
 
 def votes_on_good(view, pool):
@@ -576,15 +730,22 @@ def speak_text(view, rng):
     game = view.get("game")
     if role == "seer":
         finds = [s for s in wolf_findings(view) if s in alive_seats(view)] or wolf_findings(view)
+        day = view.get("day", 1)
         if finds:
+            # A finding is the whole reason to claim: speak on the day it lands
+            # and repeat the full sheet every day after, dead wolves included.
             return seer_claim(view, finds)
+        if day >= 3:
+            # No wolf yet: the claim only starts paying once there are two
+            # inspections behind it, and it must name the cleared seat.
+            return early_claim(view, cleared_seat(view), rng)
         press = pressure_text(view, rng)
-        if view.get("day", 1) >= 2:
-            return clip("seer, nothing but village so far. " + press)
         return press
     if role == "werewolf":
         claims = claimed_seer(view)
-        if claims and view.get("day", 1) >= 2:
+        if claims:
+            # A real claim is enough, on any day: the counter-claim only works
+            # while the table is still deciding whom to believe.
             WOLF_CLAIMED[game] = True
         if WOLF_CLAIMED.get(game):
             told = counter_claim(view, rng)
@@ -614,7 +775,7 @@ def speak_text(view, rng):
             "Villager here. %s is my suspect: %s.%s" % (name_of(view, target), reason_against(view, target), tail)
         )
     if role == "doctor":
-        doc = pick(living_others(view), claimed_seer(view)) or pick(living_others(view), claimed_doctor(view))
+        doc = cover_claimant(view) or pick(living_others(view), claimed_doctor(view))
         spare = doc is not None and doc != last_protected(view)
         if not DOCTOR_SAID.get(game) and (spare or doc is None):
             DOCTOR_SAID[game] = True
@@ -652,6 +813,63 @@ def speak_text(view, rng):
     return clip("%s is my top suspect: %s. I will vote there." % (name_of(view, target), reason_against(view, target)))
 
 
+def contradicted_claimants(view, pool):
+    """Claimed seers in `pool` whose claim the record contradicts.
+
+    Either a reveal already named them something else, or their own named seats
+    did more harm than good (negative trust).
+    """
+    revealed = revealed_roles(view)
+    claims = set(claimed_seer(view))
+    out = []
+    for s in pool:
+        if s not in claims:
+            continue
+        role = revealed.get(s)
+        if role and role != "seer":
+            out.append(s)
+        elif trust_score(view, s) < 0:
+            out.append(s)
+    return out
+
+
+def weaker_claimant(view, pool):
+    """The later of two live claimants when its claim is the weaker one, else None.
+
+    A counter-claim is the wolf's move and it always lands after the real claim,
+    so a second claimant that the claim order already ranks last is the seat to
+    answer with a vote.
+    """
+    claims = [s for s in claimed_seer(view) if s in pool]
+    if len(claims) < 2:
+        return None
+    order = claim_order(view, claims)
+    trusted = trusted_claim(view)
+    if trusted is None or order[-1] == trusted:
+        return None
+    return order[-1]
+
+
+def vote_evidence(view, pool):
+    """Pool ordered by evidence against it: vote record first, then a contradicted claim.
+
+    The vote record is public and cheap to check, and it is what the table
+    already agreed on; a claim the record contradicts, or a counter-claim the
+    order ranks last, is the next best thing to put a vote on. Ties keep the
+    lowest seat so two identical views vote alike.
+    """
+    counts = {}
+    for e in votes_cast(view):
+        t = e.get("target")
+        if t in pool:
+            counts[t] = counts.get(t, 0) + 1
+    bad = set(contradicted_claimants(view, pool))
+    weak = weaker_claimant(view, pool)
+    if weak is not None:
+        bad.add(weak)
+    return sorted(pool, key=lambda s: (-counts.get(s, 0), 0 if s in bad else 1, s))
+
+
 def vote_target(view, options, rng):
     """Never abstain while a living seat other than me is on the ballot."""
     seat = my_seat(view)
@@ -671,7 +889,17 @@ def vote_target(view, options, rng):
         if hot is not None:
             return hot
         return believed_suspects(view, pool)[0]
+    ordered = vote_evidence(view, pool)
+    bad = set(contradicted_claimants(view, pool))
+    weak = weaker_claimant(view, pool)
+    if weak is not None:
+        bad.add(weak)
     trusted = trusted_claim(view)
+    # Voting a claim you already believe wastes the ballot, so the trusted
+    # claimant is skipped while the record is clean on it.
+    pickable = [s for s in ordered if s != trusted or s in bad]
+    if pickable:
+        return pickable[0]
     if trusted is not None:
         want = [s for s in claim_names(view, trusted) if s in pool]
         if want:
@@ -686,20 +914,25 @@ def vote_target(view, options, rng):
 
 
 def kill_target(view, options, rng):
-    """Converge with the partner: mirror its pick, else the highest threat living non-wolf.
+    """Converge with the partner: mirror its pick, else the biggest threat, in order.
 
     Mirroring is what actually kills somebody: two different seats kill nobody.
     The fallback is a rule both wolves compute from the same public log, so the
-    partner, voting second and seeing this pick, lands on the same seat.
+    partner, voting second and seeing this pick, lands on the same seat. After
+    the partner's pick the order is: a claimed seer, a claimed doctor, the seat
+    that went at a wolf hardest, then the lowest seat as the last resort.
     """
     if not options:
         return None
     mate = partner_vote_tonight(view)
     if mate is not None:
         return mate
-    claimed = pick(options, claimed_seer(view))
+    claimed = pick(options, claim_order(view, claimed_seer(view)))
     if claimed is not None:
         return claimed
+    doctor = pick(options, claim_order(view, claimed_doctor(view)))
+    if doctor is not None:
+        return doctor
     hot = accused_wolf_most(view, list(options))
     if hot is not None:
         return hot
@@ -707,7 +940,13 @@ def kill_target(view, options, rng):
 
 
 def protect_target(view, options, rng):
-    """A claimed seer while it lives, else the most useful talker; never me, never last night's seat."""
+    """Cover a believable seer claim, else the most useful talker; never me, never last night's seat.
+
+    A claimed seer is only worth a night when nothing revealed contradicts it
+    (no dead good role it is not, no trust gone negative). Once a claimant was
+    exiled and revealed a werewolf, the next claim is the wolf's echo, so cover
+    stops and the talk-weight ranking decides.
+    """
     seat = my_seat(view)
     banned = {seat, last_protected(view)}
     pool = [s for s in options if s not in banned]
@@ -715,9 +954,16 @@ def protect_target(view, options, rng):
         pool = [s for s in options if s != seat] or list(options)
     if not pool:
         return None
-    claimant = pick(pool, claimed_seer(view))
+    claimant = cover_claimant(view, pool)
     if claimant is not None:
         return claimant
+    if claimed_seer(view):
+        # Every claim on the table was refused (burned, contradicted or trust
+        # gone negative), so no claimant is worth a night: the weight ranking
+        # decides among the seats that never claimed.
+        rest = [s for s in pool if s not in claimed_seer(view)]
+        if rest:
+            pool = rest
     weight = {}
     for e in speeches(view):
         s = e.get("seat")
