@@ -23,6 +23,13 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 MAX_CHARS = 290
 
 COUNTERS = {}
+# Per-game memory that a view alone cannot carry: the false finding a wolf's
+# counter-claim must keep, whether it already counter-claimed, and whether the
+# doctor's last line named a target (so two such lines never run together).
+FALSE_FINDING = {}
+WOLF_CLAIMED = {}
+DOCTOR_SAID = {}
+MAX_CLAIM = 299
 
 
 def post(path, body):
@@ -197,6 +204,134 @@ def last_protected(view):
     return p.get("seat")
 
 
+def revealed_roles(view):
+    """Seat -> role for every seat whose role the game has revealed."""
+    return {p["seat"]: p.get("role") for p in players(view) if p.get("role")}
+
+
+def believed_suspects(view, pool):
+    """Pool ordered by what the revealed dead roles say about each seat.
+
+    A seat that voted for a revealed werewolf gets credit, a seat that voted for
+    a revealed good seat is a suspect; ties keep the lowest seat.
+    """
+    revealed = revealed_roles(view)
+    score = {s: 0 for s in pool}
+    for e in votes_cast(view):
+        s, t = e.get("seat"), e.get("target")
+        if s not in score or t is None:
+            continue
+        role = revealed.get(t)
+        if role == "werewolf":
+            score[s] -= 2
+        elif role:
+            score[s] += 1
+    return sorted(pool, key=lambda s: (score[s], s))
+
+
+def claimed_doctor(view):
+    """Living seats other than me that claimed the doctor in a speech."""
+    seat = my_seat(view)
+    alive = alive_seats(view)
+    out = []
+    for e in speeches(view):
+        s = e.get("seat")
+        if s is None or s == seat or s in out or s not in alive:
+            continue
+        text = named_by(e)
+        if "doctor" in text or "medic" in text:
+            out.append(s)
+    return out
+
+
+def doctor_cover(view, finds):
+    """The claimed doctor that spoke of one of my findings, else any claimed doctor."""
+    docs = claimed_doctor(view)
+    if not docs:
+        return None
+    for d in docs:
+        spoken = " " + " ".join(named_by(e) for e in speeches(view) if e.get("seat") == d)
+        for s in finds:
+            nm = (name_of(view, s) or "").lower()
+            if nm and nm in spoken:
+                return d
+    return docs[0]
+
+
+def seer_claim(view, finds):
+    """The full claim: newest wolf first, then the running list, then the doctor."""
+    newest = finds[-1]
+    text = "seer, night %s inspected %s, %s is a werewolf, exile %s" % (
+        inspect_night(view, newest),
+        name_of(view, newest),
+        name_of(view, newest),
+        name_of(view, newest),
+    )
+    older = []
+    for s in reversed(finds[:-1]):
+        older.append("night %s: %s" % (inspect_night(view, s), name_of(view, s)))
+    tail = "; earlier " + ", ".join(older) + " all wolves" if older else ""
+    if len(text + tail) > MAX_CLAIM - 45:
+        tail = ""
+    text += tail
+    doc = doctor_cover(view, finds)
+    if doc is not None:
+        text += "; doctor %s is covering me" % name_of(view, doc)
+    return clip(text[: MAX_CLAIM - 3] if len(text) > MAX_CLAIM else text)
+
+
+def pressure_text(view, rng):
+    """Before any finding: name the most-accused seat and put its votes to it."""
+    pool = living_others(view)
+    if not pool:
+        return "Seat %s here. Seer, speak up if you have anything." % my_seat(view)
+    hot = most_accused(view, pool)
+    seat = hot[0] if hot else rng.choice(pool)
+    theirs = [e for e in votes_cast(view) if e.get("seat") == seat and e.get("target") is not None]
+    if theirs:
+        last = theirs[-1]
+        return clip(
+            "%s, you voted %s on day %s: was that a wolf read or a shrug? Say which seat is "
+            "clearing you, because the table keeps naming you." % (name_of(view, seat), name_of(view, last.get("target")), last.get("day"))
+        )
+    return clip(
+        "%s, the table keeps naming you and you have not voted once: name the seat you would "
+        "exile today and the seat you would clear." % name_of(view, seat)
+    )
+
+
+def counter_claim(view, rng):
+    """A wolf's false seer claim: one village seat and night, fixed for the whole game."""
+    seat = my_seat(view)
+    game = view.get("game")
+    banned = {seat, partner_seat(view)}
+    banned.update(wolves_set(view))
+    alive = alive_seats(view)
+    held = FALSE_FINDING.get(game)
+    if held is not None and held[0] in alive:
+        target, night = held
+    else:
+        pool = [s for s in alive if s not in banned]
+        if not pool:
+            pool = [s for s in living_others(view, exclude_partner=True)]
+        if not pool:
+            return None
+        hot = accused_wolf_most(view, pool)
+        target = hot if hot is not None else most_accused(view, pool)[0] if most_accused(view, pool) else rng.choice(pool)
+        if target is None:
+            target = rng.choice(pool)
+        night = max(1, view.get("day", 2) - 1)
+        FALSE_FINDING[game] = (target, night)
+    rival = sorted(claimed_seer(view), key=lambda s: (-trust_score(view, s), s))
+    tail = ""
+    if rival:
+        tail = "; %s is the lie" % name_of(view, rival[0])
+    return clip(
+        "seer, night %s inspected %s, %s is a werewolf, exile %s%s"
+        % (night, name_of(view, target), name_of(view, target), name_of(view, target), tail)
+    )
+
+
 def partner_vote_tonight(view):
     """The target my partner already named tonight, if it is a legal kill."""
     night = view.get("day")
@@ -351,18 +486,18 @@ def villager_suspect(view, rng):
         return None
     trusted = trusted_claim(view)
     if trusted is not None:
-        for s in claim_names(view, trusted):
-            if s in pool:
-                return s
-    hot = most_accused(view, pool)
-    if hot:
-        return hot[0]
-    landed = votes_on_good(view, pool)
-    if landed:
-        return landed[0]
+        named = [s for s in claim_names(view, trusted) if s in pool]
+        if named:
+            return named[-1]
     mine = [s for s in pool if s in accusers_of(view, my_seat(view))]
     if mine:
         return mine[0]
+    ranked = believed_suspects(view, pool)
+    if ranked:
+        return ranked[0]
+    hot = most_accused(view, pool)
+    if hot:
+        return hot[0]
     return rng.choice(pool)
 
 
@@ -391,24 +526,23 @@ def inspect_night(view, seat):
 def speak_text(view, rng):
     seat = my_seat(view)
     role = my_role(view)
+    game = view.get("game")
     if role == "seer":
-        finds = [s for s in wolf_findings(view) if s in alive_seats(view)]
+        finds = [s for s in wolf_findings(view) if s in alive_seats(view)] or wolf_findings(view)
         if finds:
-            first = finds[0]
-            return clip(
-                "I am the seer and my night %s inspection came back werewolf on %s, so that read still stands; "
-                "exile %s today and I will inspect again tonight."
-                % (inspect_night(view, first), name_of(view, first), name_of(view, first))
-            )
+            return seer_claim(view, finds)
+        press = pressure_text(view, rng)
         if view.get("day", 1) >= 2:
-            return clip(
-                "I am the seer and nothing came back werewolf yet, so keep the quiet seats talking "
-                "and let me take one more night."
-            )
-        return clip("Seat %s here, reading the table. %s is my first suspect: %s." % (
-            seat, name_of(view, villager_suspect(view, rng) or seat),
-            reason_against(view, villager_suspect(view, rng) or seat)))
+            return clip("seer, nothing but village so far. " + press)
+        return press
     if role == "werewolf":
+        claims = claimed_seer(view)
+        if claims and view.get("day", 1) >= 2:
+            WOLF_CLAIMED[game] = True
+        if WOLF_CLAIMED.get(game):
+            told = counter_claim(view, rng)
+            if told:
+                return told
         target = wolf_suspect(view, rng)
         partner = me(view).get("partner") or {}
         pseat = partner.get("seat")
@@ -432,6 +566,39 @@ def speak_text(view, rng):
         return clip(
             "Villager here. %s is my suspect: %s.%s" % (name_of(view, target), reason_against(view, target), tail)
         )
+    if role == "doctor":
+        doc = pick(living_others(view), claimed_seer(view)) or pick(living_others(view), claimed_doctor(view))
+        spare = doc is not None and doc != last_protected(view)
+        if not DOCTOR_SAID.get(game) and (spare or doc is None):
+            DOCTOR_SAID[game] = True
+            if doc is not None:
+                return clip(
+                    "I am the doctor and %s is on my sheet: the seer claim is covered tonight, "
+                    "so keep the table talking and do not burn the day on it." % name_of(view, doc)
+                )
+            return clip(
+                "I am the doctor: whoever claims seer gets my cover tonight, so speak up if you have a read."
+            )
+        DOCTOR_SAID[game] = False
+        target = villager_suspect(view, rng)
+        if target is None:
+            return clip("I am the doctor and my sheet is set. Bring me a case, not a hunch.")
+        return clip(
+            "I am the doctor, my sheet is set. %s is my suspect: %s."
+            % (name_of(view, target), reason_against(view, target))
+        )
+    trusted = trusted_claim(view)
+    if trusted is not None:
+        want = [s for s in claim_names(view, trusted) if s in living_others(view)]
+        if want:
+            return clip(
+                "Following the seer's case on %s, the claim on %s holds: %s. I vote %s."
+                % (name_of(view, trusted), name_of(view, want[-1]), reason_against(view, want[-1]), name_of(view, want[-1]))
+            )
+        return clip(
+            "Following %s's seer claim; nothing it named is left alive, so I back the claim itself."
+            % name_of(view, trusted)
+        )
     target = villager_suspect(view, rng)
     if target is None:
         return clip("Nothing solid on the board yet. Everyone talk, and I will commit once someone slips.")
@@ -439,20 +606,35 @@ def speak_text(view, rng):
 
 
 def vote_target(view, options, rng):
-    known = [s for s in wolf_findings(view) if s in options]
-    if known:
-        return known[0]
+    """Never abstain while a living seat other than me is on the ballot."""
+    seat = my_seat(view)
+    pool = [s for s in options if s != seat] or list(options)
+    if not pool:
+        return None
+    role = my_role(view)
+    known = [s for s in wolf_findings(view) if s in pool]
+    if role == "seer" and known:
+        return known[-1]
+    if role == "werewolf":
+        mine = FALSE_FINDING.get(view.get("game"))
+        if WOLF_CLAIMED.get(view.get("game")) and mine is not None and mine[0] in pool:
+            return mine[0]
+        pool = [s for s in pool if s != partner_seat(view)] or pool
+        hot = accused_wolf_most(view, pool)
+        if hot is not None:
+            return hot
+        return believed_suspects(view, pool)[0]
     trusted = trusted_claim(view)
     if trusted is not None:
-        want = [s for s in claim_names(view, trusted) if s in options]
+        want = [s for s in claim_names(view, trusted) if s in pool]
         if want:
-            return want[0]
-    pool = [s for s in options if s != partner_seat(view)]
+            return want[-1]
+    ranked = believed_suspects(view, pool)
+    if ranked:
+        return ranked[0]
     hot = most_accused(view, pool)
     if hot:
         return hot[0]
-    if not pool:
-        return None
     return rng.choice(pool)
 
 
@@ -525,7 +707,8 @@ def decide(item):
     """The (kind, payload) answer for one pending decision."""
     game = item.get("game")
     kind = item.get("decision")
-    view = item.get("view") or {}
+    view = dict(item.get("view") or {})
+    view["game"] = game
     rng = rng_for(game)
     options = item.get("options") or []
     if kind == "speak":
@@ -587,6 +770,9 @@ def read_brief():
 
 
 def main():
+    FALSE_FINDING.clear()
+    WOLF_CLAIMED.clear()
+    DOCTOR_SAID.clear()
     brief = read_brief()
     log("werewolf agent up: brief %d chars, env %s" % (len(brief), ENV_URL))
     misses = 0
