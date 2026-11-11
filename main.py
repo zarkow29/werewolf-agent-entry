@@ -3,9 +3,21 @@
 
 Standard library only, deterministic: every random draw comes from a
 random.Random seeded by MAKEFUN_TRIAL_SEED plus the game number and a
-per-game decision counter, so two runs of the same trial draw the same
-values. No clock is ever read, and env requests go out strictly one at a
-time.
+decision key derived from the view, so two runs of the same trial draw the
+same values and a repeated decision for the same state returns the same
+action.
+
+Determinism rules kept here, as comments and not as runtime checks:
+  * nothing reads the clock -- time is used for sleeps only, and no sleep
+    length, elapsed time or timestamp is ever put in a request or a statement;
+    the only "now" the agent has is the view the env serves;
+  * no randomness outside rng_for(): no random.random(), no uuid, no
+    os.urandom, no set/dict iteration that a hash seed could reorder where it
+    reaches an answer (seats are always sorted or int-keyed);
+  * the decision key is (game, day, phase, kind, log length), all of which
+    come from the env, never from the order the games happened to be answered
+    in, so the live pass and the replay answer alike;
+  * env requests go out strictly one at a time, in the order they were made.
 """
 
 import hashlib
@@ -20,48 +32,81 @@ import urllib.request
 ENV_URL = os.environ.get("MAKEFUN_ENV_URL", "http://store:8080").rstrip("/")
 TRIAL_SEED = os.environ.get("MAKEFUN_TRIAL_SEED", "0")
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-MAX_CHARS = 290
+# A statement is folded to one line by the env and refused past its limit; we
+# stay far below the env's 500 so a long name list or a clipped tail can never
+# be the reason an act is refused. HARD_CLIP counts the ellipsis.
+MAX_CHARS = 280
+HARD_CLIP = 280
+OBSERVE_TIMEOUT = 25
+ACT_TIMEOUT = 25
+MAX_STATEMENT_TRIES = 3
 
-COUNTERS = {}
 # Per-game memory that a view alone cannot carry: the false finding a wolf's
 # counter-claim must keep, whether it already counter-claimed, and whether the
 # doctor's last line named a target (so two such lines never run together).
 FALSE_FINDING = {}
 WOLF_CLAIMED = {}
 DOCTOR_SAID = {}
-MAX_CLAIM = 299
+# (game, day) -> consecutive passes, so a debate turn cycle that has already
+# passed twice stops burning turns on statements.
+PASSES = {}
 
 
-def post(path, body):
-    """POST one JSON object to the env; return (status, decoded answer)."""
-    data = json.dumps(body, separators=(",", ":")).encode("utf-8")
-    req = urllib.request.Request(
-        ENV_URL + path,
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-    )
+def post(path, body, timeout=ACT_TIMEOUT):
+    """POST one JSON object to the env; return (status, decoded answer).
+
+    A transport failure (socket timeout included) answers status 0 with an
+    empty payload, so a caller can treat it as "nothing new" instead of dying.
+    """
     try:
-        with OPENER.open(req, timeout=120) as res:
+        data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        req = urllib.request.Request(
+            ENV_URL + path,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        with OPENER.open(req, timeout=timeout) as res:
             raw = res.read()
-            return res.status, json.loads(raw) if raw else {}
+            try:
+                payload = json.loads(raw) if raw else {}
+            except ValueError:
+                payload = {}
+            return res.status, payload if isinstance(payload, dict) else {}
     except urllib.error.HTTPError as err:
         try:
             raw = err.read()
             payload = json.loads(raw) if raw else {}
         except (ValueError, OSError):
             payload = {}
-        return err.code, payload
-    except (urllib.error.URLError, OSError):
+        return err.code, payload if isinstance(payload, dict) else {}
+    except (urllib.error.URLError, OSError, TimeoutError):
+        # URLError wraps socket.timeout; OSError covers a bare one.
         return 0, {}
 
 
-def rng_for(game):
-    """A fresh Random for one decision in one game, derived from the seed."""
-    n = COUNTERS.get(game, 0)
-    COUNTERS[game] = n + 1
+def decision_key(view, kind):
+    """A key that is the same for every repeat of one pending decision.
+
+    All parts come from the env, never from a counter, so answering a game
+    twice in a row, or after a 400 plus a re-observe, draws the same values and
+    sends the same action again.
+    """
+    return "|".join(
+        (
+            str(view.get("game")),
+            str(view.get("day")),
+            str(view.get("phase")),
+            str(kind),
+            str(len(log_of(view))),
+        )
+    )
+
+
+def rng_for(view, kind):
+    """A Random for one decision, derived from the seed and the decision key."""
     digest = hashlib.sha256(
-        (TRIAL_SEED + "|" + str(game) + "|" + str(n)).encode("utf-8")
+        (TRIAL_SEED + "|" + decision_key(view, kind)).encode("utf-8")
     ).digest()
     return random.Random(int.from_bytes(digest, "big"))
 
@@ -271,13 +316,13 @@ def seer_claim(view, finds):
     for s in reversed(finds[:-1]):
         older.append("night %s: %s" % (inspect_night(view, s), name_of(view, s)))
     tail = "; earlier " + ", ".join(older) + " all wolves" if older else ""
-    if len(text + tail) > MAX_CLAIM - 45:
+    if len(text + tail) > MAX_CHARS - 45:
         tail = ""
     text += tail
     doc = doctor_cover(view, finds)
     if doc is not None:
         text += "; doctor %s is covering me" % name_of(view, doc)
-    return clip(text[: MAX_CLAIM - 3] if len(text) > MAX_CLAIM else text)
+    return clip(text)
 
 
 def pressure_text(view, rng):
@@ -402,11 +447,13 @@ def pick(options, wanted):
     return None
 
 
-def clip(text):
-    """One line, well under the 500-character statement limit."""
+def clip(text, limit=HARD_CLIP):
+    """One line, hard-clipped at `limit` code points with the ellipsis inside the count."""
     text = " ".join((text or "").split())
-    if len(text) > MAX_CHARS:
-        text = text[: MAX_CHARS - 3].rstrip() + "..."
+    if limit <= 3:
+        return text[:limit]
+    if len(text) > limit:
+        text = text[: limit - 3].rstrip() + "..."
     return text
 
 
@@ -703,53 +750,139 @@ def said_enough(view):
     return len(mine) >= 2
 
 
+def safe_payload(kind, options):
+    """The safest legal action when a decision blew up: pass, else the first option."""
+    if kind == "speak":
+        return {"pass": True}
+    if options:
+        return {"target": options[0]}
+    return {"target": None}
+
+
+def speak_decision(view, item):
+    """A statement, or a pass once this debate cycle has passed twice already."""
+    key = (view.get("game"), view.get("day"))
+    if PASSES.get(key, 0) >= 2:
+        return {"pass": True}
+    if said_enough(view):
+        PASSES[key] = PASSES.get(key, 0) + 1
+        return {"pass": True}
+    try:
+        text = speak_text(view, rng_for(view, "speak"))
+    except Exception as exc:  # a broken speech is a pass, never a crash
+        log("speech failed game=%s: %s: %s" % (view.get("game"), type(exc).__name__, exc))
+        text = ""
+    limit = item.get("max_chars")
+    if not isinstance(limit, int) or limit <= 3:
+        limit = HARD_CLIP
+    text = clip(text, min(HARD_CLIP, limit))
+    if not text:
+        PASSES[key] = PASSES.get(key, 0) + 1
+        return {"pass": True}
+    PASSES[key] = 0
+    return {"text": text}
+
+
 def decide(item):
-    """The (kind, payload) answer for one pending decision."""
+    """The (kind, payload) answer for one pending decision, safe against any view."""
     game = item.get("game")
     kind = item.get("decision")
+    options = [o for o in (item.get("options") or []) if isinstance(o, int)]
+    if not options and item.get("options"):
+        options = list(item.get("options") or [])
     view = dict(item.get("view") or {})
     view["game"] = game
-    rng = rng_for(game)
-    options = item.get("options") or []
-    if kind == "speak":
-        if said_enough(view):
-            return kind, {"pass": True}
-        text = speak_text(view, rng)
-        if not text:
-            return kind, {"pass": True}
-        return kind, {"text": text}
-    if kind == "vote":
-        return kind, {"target": vote_target(view, options, rng)}
-    if kind == "kill":
-        return kind, {"target": kill_target(view, options, rng)}
-    if kind == "protect":
-        return kind, {"target": protect_target(view, options, rng)}
-    if kind == "inspect":
-        return kind, {"target": inspect_target(view, options, rng)}
-    return None, None
+    try:
+        if kind == "speak":
+            return kind, speak_decision(view, item)
+        rng = rng_for(view, kind)
+        if kind == "vote":
+            return kind, {"target": vote_target(view, options, rng)}
+        if kind == "kill":
+            return kind, {"target": kill_target(view, options, rng)}
+        if kind == "protect":
+            return kind, {"target": protect_target(view, options, rng)}
+        if kind == "inspect":
+            return kind, {"target": inspect_target(view, options, rng)}
+        return None, None
+    except Exception as exc:
+        # One malformed view or odd option list must not kill the loop: answer
+        # the safest legal action and let the game carry on.
+        log("decide failed game=%s kind=%s: %s: %s" % (game, kind, type(exc).__name__, exc))
+        return (kind, safe_payload(kind, options)) if kind else (None, None)
+
+
+def refresh(game, item):
+    """Re-observe after a refusal and return that game's fresh item, else the old one."""
+    status, obs = post("/observe", {}, timeout=OBSERVE_TIMEOUT)
+    if 200 <= status < 300:
+        for again in obs.get("pending") or []:
+            if isinstance(again, dict) and again.get("game") == game:
+                return again
+    return item
 
 
 def answer(item):
-    """Act on one pending item; re-observe and retry once on a 400 or 409."""
+    """Act on one pending item; on a 400 or 409 re-observe and retry that game once."""
     game = item.get("game")
-    for attempt in (0, 1):
-        kind, payload = decide(item)
+    for attempt in (1, 2):
+        if attempt == 2:
+            # The retry only helps with a fresh view; when the re-observe gave
+            # the same item back, answer the safest legal action instead.
+            kind, payload = decide_fallback(item)
+        else:
+            kind, payload = decide(item)
         if kind is None:
             return
         body = {"game": game, "decision": kind}
         body.update(payload)
-        status, answer_json = post("/act", body)
+        try:
+            status, answer_json = post("/act", body)
+        except Exception as exc:  # post already guards, this is the last net
+            log("act failed game=%s kind=%s: %s" % (game, kind, exc))
+            return
         if 200 <= status < 300:
             return
-        if status in (400, 409) and attempt == 0:
-            status2, obs = post("/observe", {})
-            for again in obs.get("pending") or []:
-                if again.get("game") == game:
-                    item = again
-                    break
-            continue
+        if status in (400, 409) and attempt == 1:
+            fresh = refresh(game, item)
+            if fresh is not item and isinstance(fresh, dict) and fresh is not None:
+                item = fresh
+                # retry with the new item through decide(), not the fallback
+                kind, payload = decide(item)
+                if kind is None:
+                    return
+                body = {"game": game, "decision": kind}
+                body.update(payload)
+                try:
+                    status, answer_json = post("/act", body)
+                except Exception as exc:
+                    log("act failed game=%s kind=%s: %s" % (game, kind, exc))
+                    return
+                if 200 <= status < 300:
+                    return
+            kind, payload = decide_fallback(item)
+            if kind is None:
+                return
+            body = {"game": game, "decision": kind}
+            body.update(payload)
+            try:
+                status, answer_json = post("/act", body)
+            except Exception as exc:
+                log("act failed game=%s kind=%s: %s" % (game, kind, exc))
+                return
+            if 200 <= status < 300:
+                return
+            log("act refused twice game=%s status=%s %s" % (game, status, json.dumps(answer_json)[:160]))
+            return
         log("act refused game=%s kind=%s status=%s %s" % (game, kind, status, json.dumps(answer_json)[:160]))
         return
+
+
+def decide_fallback(item):
+    """The safest legal action for one pending item, never raising."""
+    kind = item.get("decision")
+    options = [o for o in (item.get("options") or []) if isinstance(o, int)] or list(item.get("options") or [])
+    return (kind, safe_payload(kind, options)) if kind else (None, None)
 
 
 def log(line):
@@ -773,26 +906,55 @@ def main():
     FALSE_FINDING.clear()
     WOLF_CLAIMED.clear()
     DOCTOR_SAID.clear()
+    PASSES.clear()
     brief = read_brief()
     log("werewolf agent up: brief %d chars, env %s" % (len(brief), ENV_URL))
     misses = 0
+    stalls = 0
     games_seen = set()
+    streak_game, streak = None, 0
     while True:
-        status, obs = post("/observe", {})
+        # The observe carries the long poll, so 25 s here is a wait, not a spin.
+        status, obs = post("/observe", {}, timeout=OBSERVE_TIMEOUT)
+        if status == 0:
+            # A socket timeout means "nothing pending yet": the request already
+            # held open on its own, so go straight round again without sleeping.
+            stalls += 1
+            if stalls > 400:
+                log("observe keeps timing out, giving up")
+                return 1
+            continue
         if status < 200 or status >= 300:
             misses += 1
             if misses > 60:
                 log("observe keeps failing (%s), giving up" % status)
                 return 1
-            time.sleep(0.5)
+            time.sleep(0.25)
             continue
         misses = 0
-        for item in obs.get("pending") or []:
-            games_seen.add(item.get("game"))
-            answer(item)
+        stalls = 0
+        pending = [p for p in (obs.get("pending") or []) if isinstance(p, dict)]
+        acted = 0
+        for item in pending:
+            game = item.get("game")
+            streak = streak + 1 if game == streak_game else 1
+            streak_game = game
+            if streak > 3:
+                # This game already burned three turns in a row; it gets its
+                # turn again once another game has had one.
+                continue
+            games_seen.add(game)
+            try:
+                answer(item)
+            except Exception as exc:  # the loop outlives any one bad answer
+                log("answer died game=%s: %s: %s" % (game, type(exc).__name__, exc))
+            acted += 1
         if obs.get("done"):
             log("trial done: %s games, %s finished" % (obs.get("games"), obs.get("finished")))
             return 0
+        if not acted:
+            streak_game, streak = None, 0
+            time.sleep(0.2)
 
 
 if __name__ == "__main__":
